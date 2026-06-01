@@ -1,11 +1,16 @@
-#!/usr/bin/env node
+/**
+ * Database bootstrap migration runner.
+ * Loads environment config, executes the consolidated init SQL file, and verifies required tables.
+ */
+
+// #!/usr/bin/env node
 
 require("dotenv").config();
 const { Pool } = require("pg");
 const fs = require("fs");
 const path = require("path");
 
-// Database configuration from .env
+// Database connection values come from environment config, with local fallbacks.
 const pool = new Pool({
   host: process.env.DB_HOST || "localhost",
   port: process.env.DB_PORT || 5433,
@@ -14,6 +19,9 @@ const pool = new Pool({
   database: process.env.DB_NAME || "eventopia-fatima",
 });
 
+/**
+ * Runs the bootstrap migration and verifies core runtime tables.
+ */
 async function runMigration() {
   const client = await pool.connect();
 
@@ -43,7 +51,7 @@ async function runMigration() {
     );
     console.log("🔗 Base + post-init schema migrations are applied");
 
-    // Verify critical tables required by runtime controllers/services
+    // Confirms tables needed by runtime controllers and services exist.
     const requiredTables = [
       "users",
       "territories",
@@ -69,7 +77,6 @@ async function runMigration() {
       );
     }
 
-    // Verify some key tables were created
     const tablesQuery = `
       SELECT table_name
       FROM information_schema.tables
@@ -93,5 +100,4 @@ async function runMigration() {
   }
 }
 
-// Run the migration
 runMigration().catch(console.error);

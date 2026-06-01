@@ -17,13 +17,6 @@ const updateEventLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// const statusChangeLimiter = rateLimit({
-//   windowMs: 60 * 60 * 1000, // 1 hour
-//   max: 5, // Limit each IP to 5 status change requests per hour
-//   message: (req, res) => fail(res, req, 429, "RATE_LIMIT", "Too many status change attempts, please try again later"),
-//   standardHeaders: true,
-//   legacyHeaders: false,
-// });
 
 const createOrderLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
