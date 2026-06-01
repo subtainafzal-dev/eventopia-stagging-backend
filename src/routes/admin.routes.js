@@ -17,10 +17,14 @@ const {
   detachPromoterFromGuru,
   completeEvent,
   cancelEvent,
+  approveCancellationRequest,
   listPromoters,
   getPromoter,
   approvePendingEvent,
   listPendingApprovalEvents,
+  listRefundRequests,
+  approveRefundRequest,
+  rejectRefundRequest,
   listEvents,
   getEvent,
   listCharityApplications,
@@ -65,32 +69,44 @@ router.use(requireAuth);
 
 // King's Account pending approval event review
 router.get("/kings-account/events/pending-approval", requireRole("kings_account", "founder", "admin"), listPendingApprovalEvents);
+router.get("/kings-account/refunds", requireRole("kings_account", "founder", "admin"), listRefundRequests);
+router.post("/kings-account/refunds/:id/approve", requireRole("kings_account", "founder", "admin"), approveRefundRequest);
+router.post("/kings-account/refunds/:id/reject", requireRole("kings_account", "founder", "admin"), rejectRefundRequest);
 router.post("/kings-account/events/:eventId/approve", requireRole("kings_account", "founder", "admin"), approvePendingEvent);
 router.post("/kings-account/events/:eventId/cancel", requireRole("kings_account", "founder", "admin"), cancelEvent);
+router.post("/kings-account/events/:eventId/cancel/approve", requireRole("kings_account", "founder", "admin"), approveCancellationRequest);
 // Promoter -> Promoter referral payout admin APIs (Flow 1)
 router.get("/referral-pool", requireRole("kings_account", "founder", "admin"), getReferralPool);
 router.post("/referrals/:id/approve-payout", requireRole("kings_account", "founder", "admin"), approveReferralPayoutByAdmin);
 
+// Territory licence inventory (King's Account / founder / admin)
+router.get("/territories", requireRole("kings_account", "founder", "admin"), listTerritories);
+router.get("/territories/:id/licences", requireRole("kings_account", "founder", "admin"), getTerritoryLicences);
+router.get("/territories/:id", requireRole("kings_account", "founder", "admin"), getTerritory);
+router.post("/territories", requireRole("kings_account", "founder", "admin"), createTerritory);
+router.patch("/territories/:id", requireRole("kings_account", "founder", "admin"), updateTerritory);
+
+// Territory applications (waitlist) (King's Account / founder / admin)
+router.get("/territory-applications", requireRole("kings_account", "founder", "admin"), listTerritoryApplications);
+router.post("/territory-applications/:id/approve", requireRole("kings_account", "founder", "admin"), approveTerritoryApplication);
+router.post("/territory-applications/:id/reject", requireRole("kings_account", "founder", "admin"), rejectTerritoryApplication);
+
+// Territory licences (King's Account / founder / admin)
+router.post("/territory-licences/:id/suspend", requireRole("kings_account", "founder", "admin"), suspendTerritoryLicence);
+
+// Network Manager approval / reject (King's Account / founder)
+router.post(
+  "/network-managers/:applicationId/approve",
+  requireRole("kings_account", "founder"),
+  approveNetworkManagerApplication
+);
+router.post(
+  "/network-managers/:applicationId/reject",
+  requireRole("kings_account", "founder"),
+  rejectNetworkManagerApplication
+);
+
 router.use(requireFounderOrAdmin);
-
-// Network Manager approval / reject
-router.post("/network-managers/:applicationId/approve", approveNetworkManagerApplication);
-router.post("/network-managers/:applicationId/reject", rejectNetworkManagerApplication);
-
-// Territory licence inventory (admin)
-router.get("/territories", listTerritories);
-router.get("/territories/:id/licences", getTerritoryLicences);
-router.get("/territories/:id", getTerritory);
-router.post("/territories", createTerritory);
-router.patch("/territories/:id", updateTerritory);
-
-// Territory applications (waitlist)
-router.get("/territory-applications", listTerritoryApplications);
-router.post("/territory-applications/:id/approve", approveTerritoryApplication);
-router.post("/territory-applications/:id/reject", rejectTerritoryApplication);
-
-// Territory licences (admin)
-router.post("/territory-licences/:id/suspend", suspendTerritoryLicence);
 
 // Guru application approval
 router.post("/gurus/:applicationId/approve", approveGuruApplication);

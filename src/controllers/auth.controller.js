@@ -3190,13 +3190,18 @@ async function promoterRegisterViaReferral(req, res) {
         [user.id, guruId]
       );
 
-      await client.query(
-        `INSERT INTO promoter_profiles (user_id, guru_id, created_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (user_id) DO UPDATE SET guru_id = EXCLUDED.guru_id`,
-        [user.id, guruId]
-      );
     }
+
+    // Always ensure promoter profile exists for promoter-role users.
+    // Some flows may register a promoter without an attached guru yet.
+    await client.query(
+      `INSERT INTO promoter_profiles (user_id, guru_id, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET guru_id = COALESCE(EXCLUDED.guru_id, promoter_profiles.guru_id),
+           updated_at = NOW()`,
+      [user.id, guruId || null]
+    );
 
     await ensurePromoterCreditWallet(client, user.id);
 
@@ -3757,8 +3762,21 @@ async function guruRegisterViaInvite(req, res) {
     // console.log(`[GURU REGISTER] Creating user for email: ${inviteData.email}`);
 
     const userResult = await client.query(
-      `INSERT INTO users (email, password_hash, name, phone, role, status, account_status, email_status, email_verified_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `INSERT INTO users (
+         email,
+         password_hash,
+         name,
+         phone,
+         role,
+         status,
+         account_status,
+         email_status,
+         email_verified_at,
+         guru_active,
+         guru_active_until,
+         guru_activation_date
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), TRUE, NOW() + INTERVAL '1 year', NOW())
        RETURNING *`,
       [
         inviteData.email,

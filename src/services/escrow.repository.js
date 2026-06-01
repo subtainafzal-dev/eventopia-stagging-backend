@@ -40,11 +40,29 @@ class EscrowRepository {
    */
   async fetchEscrowAccount(territoryId) {
     const query = `
-      SELECT id, territory_id, balance as current_balance, 
-             pending_liabilities, coverage_ratio, interest_earned, 
-             created_at, updated_at
-      FROM escrow_accounts
-      WHERE territory_id = $1
+      SELECT
+        COALESCE(
+          NULLIF(to_jsonb(ea)->>'id', '')::bigint,
+          NULLIF(to_jsonb(ea)->>'escrow_account_id', '')::bigint
+        ) AS id,
+        ea.territory_id,
+        COALESCE(
+          NULLIF(to_jsonb(ea)->>'current_balance', '')::numeric,
+          NULLIF(to_jsonb(ea)->>'balance', '')::numeric,
+          0::numeric
+        ) AS current_balance,
+        COALESCE(NULLIF(to_jsonb(ea)->>'pending_liabilities', '')::numeric, 0::numeric) AS pending_liabilities,
+        NULLIF(to_jsonb(ea)->>'coverage_ratio', '')::numeric AS coverage_ratio,
+        COALESCE(NULLIF(to_jsonb(ea)->>'interest_earned', '')::numeric, 0::numeric) AS interest_earned,
+        ea.created_at,
+        ea.updated_at
+      FROM escrow_accounts ea
+      WHERE ea.territory_id = $1
+      AND (
+        to_jsonb(ea)->>'account_type' IS NULL
+        OR to_jsonb(ea)->>'account_type' = 'escrow'
+      )
+      ORDER BY CASE WHEN to_jsonb(ea)->>'account_type' = 'escrow' THEN 0 ELSE 1 END, ea.created_at DESC
       LIMIT 1
     `;
     const result = await db.query(query, [territoryId]);

@@ -520,7 +520,6 @@ class GuruService {
         JOIN promoter_guru_links pgl ON pgl.promoter_user_id = u.id
         WHERE u.email = pri.email
           AND pgl.guru_user_id = pri.guru_user_id
-          AND COALESCE(u.account_status, '') = 'active'
       )`;
 
     if (dateFrom) {
@@ -533,7 +532,7 @@ class GuruService {
     }
 
     const result = await pool.query(
-      `SELECT
+      `SELECT DISTINCT ON (LOWER(pri.email))
          pri.id,
          pri.name,
          pri.email,
@@ -541,7 +540,7 @@ class GuruService {
          pri.expires_at
        FROM promoter_referral_invites pri
        ${whereClause}
-       ORDER BY pri.created_at DESC`,
+       ORDER BY LOWER(pri.email), pri.created_at DESC`,
       params
     );
 

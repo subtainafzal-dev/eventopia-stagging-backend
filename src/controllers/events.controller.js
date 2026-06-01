@@ -25,6 +25,43 @@ function generateShareToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
+function canManageEventStatus(user) {
+  return user?.role === "promoter" || user?.role === "kings_account";
+}
+
+async function getEventForStatusAction(client, eventId, user, selectClause) {
+  if (!canManageEventStatus(user)) {
+    return { unauthorized: true, result: null };
+  }
+
+  if (user.role === "kings_account") {
+    const result = await client.query(
+      `SELECT ${selectClause} FROM events WHERE id = $1`,
+      [eventId]
+    );
+    return { unauthorized: false, result };
+  }
+
+  const result = await client.query(
+    `SELECT ${selectClause} FROM events WHERE id = $1 AND promoter_id = $2`,
+    [eventId, user.id]
+  );
+  return { unauthorized: false, result };
+}
+
+let cachedEventsColumns = null;
+
+async function getEventsColumnSet(client) {
+  if (cachedEventsColumns) return cachedEventsColumns;
+  const columnsResult = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'events'`
+  );
+  cachedEventsColumns = new Set(columnsResult.rows.map((r) => r.column_name));
+  return cachedEventsColumns;
+}
+
 /**
  * Helper function to derive hierarchy attribution from promoter
  */
@@ -100,38 +137,52 @@ async function createEvent(req, res) {
       shareToken = generateShareToken();
     }
 
-    // Insert event
+    const eventColumns = await getEventsColumnSet(client);
+    const insertColumns = [
+      "promoter_id", "guru_id", "network_manager_id", "territory_id",
+      "title", "description", "start_at", "end_at", "timezone",
+      "format", "access_mode", "visibility", "share_token",
+      "venue_name", "venue_address", "lat", "lng",
+      "category_id", "status", "ticketing_required"
+    ];
+    const insertValues = [
+      promoterId,
+      hierarchy.guru_id,
+      hierarchy.network_manager_id,
+      hierarchy.territory_id,
+      title || null,
+      description || null,
+      startAt || null,
+      endAt || null,
+      timezone,
+      format,
+      accessMode,
+      visibilityMode,
+      shareToken,
+      venueName || null,
+      venueAddress || null,
+      lat ?? null,
+      lng ?? null,
+      categoryId || null,
+      "draft",
+      true
+    ];
+
+    if (eventColumns.has("city_display")) {
+      insertColumns.push("city_display");
+      insertValues.push(city || null);
+    }
+    if (eventColumns.has("city")) {
+      insertColumns.push("city");
+      insertValues.push(city || null);
+    }
+
+    const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(", ");
     const eventResult = await client.query(
-      `INSERT INTO events (
-         promoter_id, guru_id, network_manager_id, territory_id,
-         title, description, start_at, end_at, timezone,
-         format, access_mode, visibility, share_token,
-         city_display, venue_name, venue_address, lat, lng,
-         category_id, status, ticketing_required
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'draft', true)
+      `INSERT INTO events (${insertColumns.join(", ")})
+       VALUES (${placeholders})
        RETURNING id`,
-      [
-        promoterId,
-        hierarchy.guru_id,
-        hierarchy.network_manager_id,
-        hierarchy.territory_id,
-        title || null,
-        description || null,
-        startAt || null,
-        endAt || null,
-        timezone,
-        format,
-        accessMode,
-        visibilityMode,
-        shareToken,
-        city || null,
-        venueName || null,
-        venueAddress || null,
-        lat ?? null,
-        lng ?? null,
-        categoryId || null,
-      ]
+      insertValues
     );
 
     const eventId = eventResult.rows[0].id;
@@ -197,10 +248,10 @@ async function updateEvent(req, res) {
 
     const event = checkResult.rows[0];
 
-    // Phase E0: Guard - Cannot edit cancelled events
-    if (event.status === 'cancelled') {
+    // Phase E0: Guard - Cannot edit cancelled or cancellation-requested events
+    if (event.status === 'cancelled' || event.status === 'cancellation_requested') {
       await client.query("ROLLBACK");
-      return fail(res, req, 400, "INVALID_STATE", "Cancelled events cannot be edited");
+      return fail(res, req, 400, "INVALID_STATE", "Cancelled or cancellation-requested events cannot be edited");
     }
 
     // Build dynamic update
@@ -221,7 +272,11 @@ async function updateEvent(req, res) {
     if (format !== undefined) addField("format", format);
     if (accessMode !== undefined) addField("access_mode", accessMode);
     if (visibilityMode !== undefined) addField("visibility", visibilityMode);
-    if (city !== undefined) addField("city_display", city);
+    const eventColumns = await getEventsColumnSet(client);
+    if (city !== undefined) {
+      if (eventColumns.has("city_display")) addField("city_display", city);
+      if (eventColumns.has("city")) addField("city", city);
+    }
     if (venueName !== undefined) addField("venue_name", venueName);
     if (venueAddress !== undefined) addField("venue_address", venueAddress);
     if (lat !== undefined) addField("lat", lat);
@@ -486,11 +541,17 @@ async function submitEvent(req, res) {
     const eventId = validateEventId(req.params.eventId);
     await client.query("BEGIN");
 
-    const eventResult = await client.query(
-      `SELECT status, title, description, start_at, end_at, city_display, format, access_mode, venue_name, venue_address, cover_image_url
-       FROM events WHERE id = $1 AND promoter_id = $2`,
-      [eventId, req.user.id]
+    const { unauthorized, result: eventResult } = await getEventForStatusAction(
+      client,
+      eventId,
+      req.user,
+      "status, title, description, start_at, end_at, city_display, format, access_mode, venue_name, venue_address, cover_image_url"
     );
+
+    if (unauthorized) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Only promoters or kings_account can update event status");
+    }
 
     if (eventResult.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -509,9 +570,9 @@ async function submitEvent(req, res) {
       return fail(res, req, 400, "INVALID_STATE", "Published events cannot be submitted for approval");
     }
 
-    if (event.status === 'cancelled') {
+    if (event.status === 'cancelled' || event.status === 'cancellation_requested') {
       await client.query("ROLLBACK");
-      return fail(res, req, 400, "INVALID_STATE", "Cancelled events cannot be submitted for approval");
+      return fail(res, req, 400, "INVALID_STATE", "Cancelled or cancellation-requested events cannot be submitted for approval");
     }
 
     const missingFields = await getEventSubmissionMissingFields(client, event, eventId);
@@ -553,11 +614,17 @@ async function publishEvent(req, res) {
     const eventId = validateEventId(req.params.eventId);
     await client.query("BEGIN");
 
-    const eventResult = await client.query(
-      `SELECT status, title, description, start_at, end_at, city_display, format, access_mode, venue_name, venue_address, cover_image_url
-       FROM events WHERE id = $1 AND promoter_id = $2`,
-      [eventId, req.user.id]
+    const { unauthorized, result: eventResult } = await getEventForStatusAction(
+      client,
+      eventId,
+      req.user,
+      "status, title, description, start_at, end_at, city_display, format, access_mode, venue_name, venue_address, cover_image_url"
     );
+
+    if (unauthorized) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Only promoters or kings_account can update event status");
+    }
 
     if (eventResult.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -571,9 +638,9 @@ async function publishEvent(req, res) {
       return fail(res, req, 400, "INVALID_STATE", "Event is already published");
     }
 
-    if (event.status === 'cancelled') {
+    if (event.status === 'cancelled' || event.status === 'cancellation_requested') {
       await client.query("ROLLBACK");
-      return fail(res, req, 400, "INVALID_STATE", "Cancelled events cannot be published");
+      return fail(res, req, 400, "INVALID_STATE", "Cancelled or cancellation-requested events cannot be published");
     }
 
     // Phase E4: Publish validation (client-aligned)
@@ -618,10 +685,17 @@ async function pauseEvent(req, res) {
     const eventId = validateEventId(req.params.eventId);
     await client.query("BEGIN");
 
-    const result = await client.query(
-      `SELECT status FROM events WHERE id = $1 AND promoter_id = $2`,
-      [eventId, req.user.id]
+    const { unauthorized, result } = await getEventForStatusAction(
+      client,
+      eventId,
+      req.user,
+      "status"
     );
+
+    if (unauthorized) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Only promoters or kings_account can update event status");
+    }
 
     if (result.rowCount === 0 || result.rows[0].status !== 'published') {
       await client.query("ROLLBACK");
@@ -657,10 +731,17 @@ async function cancelEvent(req, res) {
 
     await client.query("BEGIN");
 
-    const result = await client.query(
-      `SELECT status FROM events WHERE id = $1 AND promoter_id = $2`,
-      [eventId, req.user.id]
+    const { unauthorized, result } = await getEventForStatusAction(
+      client,
+      eventId,
+      req.user,
+      "status"
     );
+
+    if (unauthorized) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Only promoters or kings_account can update event status");
+    }
 
     if (result.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -671,16 +752,28 @@ async function cancelEvent(req, res) {
       await client.query("ROLLBACK");
       return fail(res, req, 400, "INVALID_STATE", "Event is already cancelled");
     }
+    if (result.rows[0].status === 'cancellation_requested') {
+      await client.query("ROLLBACK");
+      return fail(res, req, 409, "DUPLICATE_REQUEST", "Cancellation request already submitted and pending admin review");
+    }
 
     await client.query(
-      `UPDATE events SET status = 'cancelled', cancelled_at = NOW(), cancel_reason = $1, updated_at = NOW() WHERE id = $2`,
+      `UPDATE events
+       SET status = 'cancellation_requested',
+           cancel_reason = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
       [reason || null, eventId]
     );
 
     await client.query("COMMIT");
-    await logEventChange(req, 'cancelled', eventId, { cancelReason: reason });
+    await logEventChange(req, 'cancellation_requested', eventId, { cancelReason: reason });
 
-    return ok(res, req, { id: parseInt(eventId, 10), status: 'cancelled' });
+    return ok(res, req, {
+      id: parseInt(eventId, 10),
+      status: 'cancellation_requested',
+      message: 'Cancellation request submitted. Awaiting admin approval.'
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     return fail(res, req, 500, "INTERNAL_ERROR", err.message);
@@ -699,10 +792,17 @@ async function republishEvent(req, res) {
     const eventId = validateEventId(req.params.eventId);
     await client.query("BEGIN");
 
-    const result = await client.query(
-      `SELECT status FROM events WHERE id = $1 AND promoter_id = $2`,
-      [eventId, req.user.id]
+    const { unauthorized, result } = await getEventForStatusAction(
+      client,
+      eventId,
+      req.user,
+      "status"
     );
+
+    if (unauthorized) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Only promoters or kings_account can update event status");
+    }
 
     if (result.rowCount === 0 || result.rows[0].status !== 'unpublished') {
       await client.query("ROLLBACK");
@@ -1080,7 +1180,7 @@ async function getEventDetail(req, res) {
         u.name as promoter_name
        FROM events e
        LEFT JOIN users u ON u.id = e.promoter_id
-       WHERE e.id = $1 AND e.status = '${BUYER_VISIBLE_EVENT_STATUS}' AND e.visibility_mode = 'public'`,
+       WHERE e.id = $1 AND e.status = '${BUYER_VISIBLE_EVENT_STATUS}' AND e.visibility = 'public'`,
       [eventId]
     );
 
@@ -1353,10 +1453,17 @@ async function completeEvent(req, res) {
     const eventId = validateEventId(req.params.eventId);
     await client.query("BEGIN");
 
-    const result = await client.query(
-      `SELECT status, end_at FROM events WHERE id = $1 AND promoter_id = $2`,
-      [eventId, req.user.id]
+    const { unauthorized, result } = await getEventForStatusAction(
+      client,
+      eventId,
+      req.user,
+      "status, end_at"
     );
+
+    if (unauthorized) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Only promoters or kings_account can update event status");
+    }
 
     if (result.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -1365,9 +1472,9 @@ async function completeEvent(req, res) {
 
     const event = result.rows[0];
 
-    if (event.status === 'cancelled') {
+    if (event.status === 'cancelled' || event.status === 'cancellation_requested') {
       await client.query("ROLLBACK");
-      return fail(res, req, 400, "INVALID_STATE", "Cancelled events cannot be completed");
+      return fail(res, req, 400, "INVALID_STATE", "Cancelled or cancellation-requested events cannot be completed");
     }
 
     await client.query(

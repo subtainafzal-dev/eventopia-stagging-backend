@@ -671,9 +671,18 @@ async function setupAccount(req, res) {
       });
     }
 
-    // Update user's name
+    // Complete setup for invited gurus:
+    // - store full name
+    // - mark guru as publicly active for discovery APIs
     const result = await pool.query(
-      "UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email, name, role, account_status",
+      `UPDATE users
+       SET name = $1,
+           guru_active = TRUE,
+           guru_active_until = COALESCE(guru_active_until, NOW() + INTERVAL '1 year'),
+           guru_activation_date = COALESCE(guru_activation_date, NOW()),
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, email, name, role, account_status, guru_active, guru_active_until, guru_activation_date`,
       [name.trim(), userId]
     );
 

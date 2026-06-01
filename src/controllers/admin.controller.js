@@ -615,7 +615,7 @@ async function getEventMetrics(req, res) {
       SELECT status, COUNT(*) as count FROM events GROUP BY status ORDER BY count DESC
     `);
 
-    const totalViews = await pool.query(`SELECT SUM(views_count) as total_views FROM events`);
+    const totalViews = await pool.query(`SELECT COUNT(*)::bigint as total_views FROM event_views`);
 
     const topPromoters = await pool.query(`
       SELECT u.id, u.name, COUNT(e.id) as events_count, SUM(e.tickets_sold) as total_tickets_sold
@@ -1140,6 +1140,83 @@ async function cancelEvent(req, res) {
 }
 
 /**
+ * Approve promoter cancellation request (King's Account / Admin)
+ * POST /admin/kings-account/events/:eventId/cancel/approve
+ */
+async function approveCancellationRequest(req, res) {
+  const client = await pool.connect();
+  try {
+    const { eventId } = req.params;
+    const { reason } = req.body;
+
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `SELECT id, status, completion_status, cancel_reason
+       FROM events
+       WHERE id = $1`,
+      [eventId]
+    );
+
+    if (eventResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 404, "NOT_FOUND", "Event not found");
+    }
+
+    const event = eventResult.rows[0];
+
+    if (event.status === "cancelled") {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Event is already cancelled");
+    }
+
+    if (event.status !== "cancellation_requested") {
+      await client.query("ROLLBACK");
+      return fail(
+        res,
+        req,
+        400,
+        "INVALID_STATE",
+        "Only cancellation requested events can be approved for cancellation"
+      );
+    }
+
+    if (event.completion_status === "completed") {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Completed events cannot be cancelled");
+    }
+
+    await client.query(
+      `UPDATE events
+       SET status = 'cancelled',
+           cancelled_at = NOW(),
+           cancel_reason = COALESCE($1, cancel_reason),
+           updated_at = NOW()
+       WHERE id = $2`,
+      [reason || null, eventId]
+    );
+
+    await client.query("COMMIT");
+    await logEventChange(req, "kings_account_cancellation_approved", parseInt(eventId, 10), {
+      cancelReason: reason || event.cancel_reason || null,
+    });
+
+    return ok(res, req, {
+      id: parseInt(eventId, 10),
+      status: "cancelled",
+      cancelledAt: new Date().toISOString(),
+      cancelReason: reason || event.cancel_reason || null,
+      message: "Cancellation request approved and event cancelled successfully",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message);
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * List all Promoters
  * GET /admin/promoters
  */
@@ -1345,19 +1422,24 @@ async function approvePendingEvent(req, res) {
 }
 
 /**
- * List events pending King's Account approval
- * GET /admin/kings-account/events/pending-approval
+ * List events for King's Account review
+ * GET /admin/kings-account/events/pending-approval?status=
  */
 async function listPendingApprovalEvents(req, res) {
   try {
-    const { page = "1", pageSize = "50", city, startDate, endDate } = req.query;
+    const { page = "1", pageSize = "50", city, startDate, endDate, status } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const pageSizeNum = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 50));
     const offset = (pageNum - 1) * pageSizeNum;
-    const conditions = ["e.status = $1"];
-    const params = ["pending_approval"];
-    let paramCount = 2;
+    const conditions = [];
+    const params = [];
+    let paramCount = 1;
+
+    if (status && status !== "all") {
+      conditions.push(`e.status = $${paramCount++}`);
+      params.push(status);
+    }
 
     if (city) {
       conditions.push(`e.city_display = $${paramCount++}`);
@@ -1374,7 +1456,9 @@ async function listPendingApprovalEvents(req, res) {
       params.push(endDate);
     }
 
-    const whereClause = `WHERE ${conditions.join(" AND ")}`;
+    const whereClause = conditions.length > 0
+      ? `WHERE ${conditions.join(" AND ")}`
+      : "";
 
     const countResult = await pool.query(
       `SELECT COUNT(*) as total FROM events e ${whereClause}`,
@@ -1416,6 +1500,365 @@ async function listPendingApprovalEvents(req, res) {
   } catch (err) {
     console.error("List pending approval Events error:", err);
     return fail(res, req, 500, "INTERNAL_ERROR", "Failed to list pending approval Events");
+  }
+}
+
+/**
+ * List refund requests for King's Account/Admin queue
+ * GET /admin/kings-account/refunds?status=&eventId=&page=&pageSize=
+ */
+async function listRefundRequests(req, res) {
+  try {
+    const { status = "submitted", eventId, page = "1", pageSize = "50" } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const pageSizeNum = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 50));
+    const offset = (pageNum - 1) * pageSizeNum;
+
+    const conditions = [];
+    const params = [];
+    let idx = 1;
+
+    if (status && status !== "all") {
+      conditions.push(`rc.status = $${idx++}`);
+      params.push(status);
+    }
+
+    if (eventId) {
+      conditions.push(`rc.event_id = $${idx++}`);
+      params.push(parseInt(eventId, 10));
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM refund_cases rc
+       ${whereClause}`,
+      params
+    );
+    const total = countResult.rows[0]?.total || 0;
+
+    const result = await pool.query(
+      `SELECT
+         rc.id,
+         rc.order_item_id,
+         rc.buyer_id,
+         rc.event_id,
+         rc.promoter_id,
+         rc.reason_code,
+         rc.status,
+         rc.amount,
+         rc.escrow_ring_fenced,
+         rc.submitted_at,
+         rc.reviewed_at,
+         rc.approved_at,
+         rc.executed_at,
+         rc.admin_notes,
+         b.name AS buyer_name,
+         b.email AS buyer_email,
+         e.title AS event_title,
+         e.cancelled_at AS event_cancelled_at
+       FROM refund_cases rc
+       JOIN users b ON b.id = rc.buyer_id
+       JOIN events e ON e.id = rc.event_id
+       ${whereClause}
+       ORDER BY rc.submitted_at DESC, rc.id DESC
+       LIMIT $${idx++} OFFSET $${idx}`,
+      [...params, pageSizeNum, offset]
+    );
+
+    const items = result.rows.map((row) => {
+      const submittedAtMs = row.submitted_at ? new Date(row.submitted_at).getTime() : null;
+      const underReviewTargetMs = submittedAtMs ? submittedAtMs + (24 * 60 * 60 * 1000) : null;
+      const nowMs = Date.now();
+      const slaStatus = underReviewTargetMs
+        ? (nowMs > underReviewTargetMs ? "overdue" : "within_target")
+        : "unknown";
+
+      return {
+        id: row.id,
+        order_item_id: row.order_item_id,
+        buyer: {
+          id: row.buyer_id,
+          name: row.buyer_name,
+          email: row.buyer_email,
+        },
+        event: {
+          id: row.event_id,
+          title: row.event_title,
+          cancelled_at: row.event_cancelled_at,
+        },
+        reason_code: row.reason_code,
+        status: row.status,
+        amount: Number(row.amount || 0) / 100,
+        escrow_ring_fenced: row.escrow_ring_fenced,
+        submitted_at: row.submitted_at,
+        reviewed_at: row.reviewed_at,
+        approved_at: row.approved_at,
+        executed_at: row.executed_at,
+        admin_notes: row.admin_notes,
+        sla: {
+          stage: "submitted_to_under_review",
+          target_hours: 24,
+          status: slaStatus,
+          target_at: underReviewTargetMs ? new Date(underReviewTargetMs).toISOString() : null,
+        },
+      };
+    });
+
+    return ok(res, req, {
+      items,
+      pagination: {
+        page: pageNum,
+        pageSize: pageSizeNum,
+        total,
+        totalPages: Math.ceil(total / pageSizeNum),
+      },
+    });
+  } catch (err) {
+    console.error("List refund requests error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to list refund requests");
+  }
+}
+
+/**
+ * Approve buyer refund request (King's Account/Admin)
+ * POST /admin/kings-account/refunds/:id/approve
+ */
+async function approveRefundRequest(req, res) {
+  const client = await pool.connect();
+  try {
+    const refundCaseId = parseInt(req.params.id, 10);
+    const { admin_notes } = req.body || {};
+
+    if (Number.isNaN(refundCaseId) || refundCaseId <= 0) {
+      return fail(res, req, 400, "VALIDATION_ERROR", "Invalid refund case id");
+    }
+
+    await client.query("BEGIN");
+
+    const caseResult = await client.query(
+      `SELECT id, status, escrow_ring_fenced, amount, buyer_id, event_id
+       FROM refund_cases
+       WHERE id = $1
+       FOR UPDATE`,
+      [refundCaseId]
+    );
+
+    if (caseResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 404, "NOT_FOUND", "Refund case not found");
+    }
+
+    const refundCase = caseResult.rows[0];
+
+    if (!["submitted", "under_review"].includes(refundCase.status)) {
+      await client.query("ROLLBACK");
+      return fail(
+        res,
+        req,
+        400,
+        "INVALID_STATE",
+        `Refund case in '${refundCase.status}' state cannot be approved`
+      );
+    }
+
+    if (!refundCase.escrow_ring_fenced) {
+      await client.query("ROLLBACK");
+      return fail(
+        res,
+        req,
+        409,
+        "ESCROW_NOT_RING_FENCED",
+        "Refund case cannot be approved because escrow is not ring-fenced"
+      );
+    }
+
+    await client.query(
+      `UPDATE refund_cases
+       SET status = 'approved',
+           approved_at = NOW(),
+           admin_notes = COALESCE($1, admin_notes)
+       WHERE id = $2`,
+      [admin_notes || null, refundCaseId]
+    );
+
+    await client.query(
+      `INSERT INTO ledger_entries (
+         entry_type, user_id, role, territory_id, amount, reference_id, reference_type, status
+       )
+       SELECT
+         'REFUND_APPROVED',
+         rc.buyer_id,
+         'buyer',
+         COALESCE(e.territory_id, 1),
+         rc.amount,
+         rc.id,
+         'REFUND_CASE',
+         'POSTED'
+       FROM refund_cases rc
+       JOIN events e ON e.id = rc.event_id
+       WHERE rc.id = $1`,
+      [refundCaseId]
+    );
+
+    await client.query("COMMIT");
+
+    return ok(res, req, {
+      id: refundCaseId,
+      status: "approved",
+      approved_at: new Date().toISOString(),
+      admin_notes: admin_notes || null,
+      message: "Refund request approved successfully",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Approve refund request error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Reject buyer refund request (King's Account/Admin)
+ * POST /admin/kings-account/refunds/:id/reject
+ */
+async function rejectRefundRequest(req, res) {
+  const client = await pool.connect();
+  try {
+    const refundCaseId = parseInt(req.params.id, 10);
+    const reason = String(req.body?.reason || "").trim();
+
+    if (Number.isNaN(refundCaseId) || refundCaseId <= 0) {
+      return fail(res, req, 400, "VALIDATION_ERROR", "Invalid refund case id");
+    }
+    if (!reason) {
+      return fail(res, req, 400, "VALIDATION_ERROR", "Reject reason is required");
+    }
+
+    await client.query("BEGIN");
+
+    const caseResult = await client.query(
+      `SELECT id, status, escrow_ring_fenced, amount, buyer_id, event_id
+       FROM refund_cases
+       WHERE id = $1
+       FOR UPDATE`,
+      [refundCaseId]
+    );
+
+    if (caseResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 404, "NOT_FOUND", "Refund case not found");
+    }
+
+    const refundCase = caseResult.rows[0];
+    if (!["submitted", "under_review", "approved"].includes(refundCase.status)) {
+      await client.query("ROLLBACK");
+      return fail(
+        res,
+        req,
+        400,
+        "INVALID_STATE",
+        `Refund case in '${refundCase.status}' state cannot be rejected`
+      );
+    }
+
+    // Release ring-fenced escrow (if previously reserved).
+    if (refundCase.escrow_ring_fenced) {
+      const escrowColumnsResult = await client.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'escrow_accounts'`
+      );
+      const escrowColumns = new Set(escrowColumnsResult.rows.map((r) => r.column_name));
+      const hasAccountType = escrowColumns.has("account_type");
+      const hasBalance = escrowColumns.has("balance");
+      const hasCurrentBalance = escrowColumns.has("current_balance");
+      const hasPendingLiabilities = escrowColumns.has("pending_liabilities");
+
+      const territoryResult = await client.query(
+        `SELECT territory_id FROM events WHERE id = $1 LIMIT 1`,
+        [refundCase.event_id]
+      );
+      const territoryId = territoryResult.rows[0]?.territory_id || 1;
+
+      if (hasPendingLiabilities) {
+        if (hasBalance) {
+          await client.query(
+            `UPDATE escrow_accounts
+             SET pending_liabilities = GREATEST(COALESCE(pending_liabilities, 0) - $1, 0),
+                 updated_at = NOW()
+             WHERE territory_id = $2`,
+            [refundCase.amount, territoryId]
+          );
+        } else if (hasCurrentBalance) {
+          const amountInCurrency = Number(refundCase.amount || 0) / 100;
+          if (hasAccountType) {
+            await client.query(
+              `UPDATE escrow_accounts
+               SET pending_liabilities = GREATEST(COALESCE(pending_liabilities, 0) - $1, 0),
+                   updated_at = NOW()
+               WHERE territory_id = $2 AND account_type = 'escrow'`,
+              [amountInCurrency, territoryId]
+            );
+          } else {
+            await client.query(
+              `UPDATE escrow_accounts
+               SET pending_liabilities = GREATEST(COALESCE(pending_liabilities, 0) - $1, 0),
+                   updated_at = NOW()
+               WHERE territory_id = $2`,
+              [amountInCurrency, territoryId]
+            );
+          }
+        }
+      }
+
+      await client.query(
+        `INSERT INTO ledger_entries (
+           entry_type, user_id, role, territory_id, amount, reference_id, reference_type, status
+         )
+         SELECT
+           'RING_FENCE_RELEASED',
+           rc.buyer_id,
+           'buyer',
+           COALESCE(e.territory_id, 1),
+           rc.amount,
+           rc.id,
+           'REFUND_CASE',
+           'POSTED'
+         FROM refund_cases rc
+         JOIN events e ON e.id = rc.event_id
+         WHERE rc.id = $1`,
+        [refundCaseId]
+      );
+    }
+
+    await client.query(
+      `UPDATE refund_cases
+       SET status = 'rejected',
+           reviewed_at = NOW(),
+           admin_notes = $1,
+           escrow_ring_fenced = FALSE
+       WHERE id = $2`,
+      [reason, refundCaseId]
+    );
+
+    await client.query("COMMIT");
+    return ok(res, req, {
+      id: refundCaseId,
+      status: "rejected",
+      rejected_reason: reason,
+      reviewed_at: new Date().toISOString(),
+      message: "Refund request rejected successfully",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Reject refund request error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message);
+  } finally {
+    client.release();
   }
 }
 
@@ -2642,10 +3085,14 @@ module.exports = {
   detachPromoterFromGuru,
   completeEvent,
   cancelEvent,
+  approveCancellationRequest,
   listPromoters,
   getPromoter,
   approvePendingEvent,
   listPendingApprovalEvents,
+  listRefundRequests,
+  approveRefundRequest,
+  rejectRefundRequest,
   listEvents,
   getEvent,
   listCharityApplications,

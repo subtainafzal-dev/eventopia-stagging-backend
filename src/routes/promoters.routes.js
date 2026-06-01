@@ -73,6 +73,20 @@ const {
   getExecutions
 } = require("../controllers/charity.controller");
 
+const requireActivePromoterOrKingsAccount = (req, res, next) => {
+  if (req.user?.role === "kings_account") {
+    return next();
+  }
+  return requireActivePromoter(req, res, next);
+};
+
+const requireEventOwnershipOrKingsAccount = (req, res, next) => {
+  if (req.user?.role === "kings_account") {
+    return next();
+  }
+  return requireEventOwnership(req, res, next);
+};
+
 // All promoter routes require authentication
 router.use(requireAuth);
 
@@ -125,17 +139,17 @@ router.put("/events/:eventId/category", requireActivePromoter, requireEventOwner
 // Set event tags
 router.put("/events/:eventId/tags", requireActivePromoter, requireEventOwnership, setEventTags);
 // Submit event for admin approval
-router.post("/events/:eventId/submit", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ submitEvent);
+router.post("/events/:eventId/submit", requireActivePromoterOrKingsAccount, requireEventOwnershipOrKingsAccount, /* statusChangeLimiter, */ submitEvent);
 // Publish event
-router.post("/events/:eventId/publish", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ publishEvent);
+router.post("/events/:eventId/publish", requireActivePromoterOrKingsAccount, requireEventOwnershipOrKingsAccount, /* statusChangeLimiter, */ publishEvent);
 // Pause event
-router.post("/events/:eventId/pause", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ pauseEvent);
+router.post("/events/:eventId/pause", requireActivePromoterOrKingsAccount, requireEventOwnershipOrKingsAccount, /* statusChangeLimiter, */ pauseEvent);
 // Cancel event
-router.post("/events/:eventId/cancel", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ cancelEvent);
+router.post("/events/:eventId/cancel", requireActivePromoterOrKingsAccount, requireEventOwnershipOrKingsAccount, /* statusChangeLimiter, */ cancelEvent);
 // Republish event
-router.post("/events/:eventId/republish", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ republishEvent);
+router.post("/events/:eventId/republish", requireActivePromoterOrKingsAccount, requireEventOwnershipOrKingsAccount, /* statusChangeLimiter, */ republishEvent);
 // Complete event
-router.post("/events/:eventId/complete", requireActivePromoter, requireEventOwnership, completeEvent);
+router.post("/events/:eventId/complete", requireActivePromoterOrKingsAccount, requireEventOwnershipOrKingsAccount, completeEvent);
 // Delete event cover image
 router.delete("/events/:eventId/cover", requireActivePromoter, requireEventOwnership, deleteEventCover);
 // Delete gallery image

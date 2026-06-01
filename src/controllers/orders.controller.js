@@ -940,6 +940,407 @@ const getBuyerTickets = async (req, res) => {
   }
 };
 
+/**
+ * Refund Centre Step 1 — list cancelled-event tickets for buyer.
+ * GET /api/orders/buyer/tickets/cancelled-events
+ */
+const getBuyerCancelledEventTickets = async (req, res) => {
+  try {
+    const buyerId = req.user.id;
+    const { page = 1, limit = 20 } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const offset = (pageNum - 1) * limitNum;
+
+    console.log("[getBuyerCancelledEventTickets:start]", {
+      buyerId,
+      page: pageNum,
+      limit: limitNum,
+      offset,
+    });
+
+    const [ownedAnyTicketsCount, cancelledOwnedTicketsCount, paidCancelledOwnedTicketsCount] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM tickets t
+         JOIN orders o ON o.id = t.order_id
+         WHERE (o.buyer_user_id = $1 OR t.user_id = $1)`,
+        [buyerId]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM tickets t
+         JOIN orders o ON o.id = t.order_id
+         JOIN events e ON e.id = o.event_id
+         WHERE (o.buyer_user_id = $1 OR t.user_id = $1)
+           AND e.status = 'cancelled'`,
+        [buyerId]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total
+         FROM tickets t
+         JOIN orders o ON o.id = t.order_id
+         JOIN events e ON e.id = o.event_id
+         WHERE (o.buyer_user_id = $1 OR t.user_id = $1)
+           AND e.status = 'cancelled'
+           AND o.payment_status IN ('paid', 'completed', 'succeeded')`,
+        [buyerId]
+      ),
+    ]);
+
+    console.log("[getBuyerCancelledEventTickets:stage-counts]", {
+      buyerId,
+      ownedAnyTickets: ownedAnyTicketsCount.rows[0]?.total ?? 0,
+      cancelledOwnedTickets: cancelledOwnedTicketsCount.rows[0]?.total ?? 0,
+      paidCancelledOwnedTickets: paidCancelledOwnedTicketsCount.rows[0]?.total ?? 0,
+    });
+
+    const sampleResult = await pool.query(
+      `SELECT
+         t.id AS ticket_id,
+         t.user_id AS ticket_user_id,
+         o.id AS order_id,
+         o.buyer_user_id,
+         o.payment_status,
+         e.id AS event_id,
+         e.status AS event_status
+       FROM tickets t
+       JOIN orders o ON o.id = t.order_id
+       JOIN events e ON e.id = o.event_id
+       WHERE (o.buyer_user_id = $1 OR t.user_id = $1)
+       ORDER BY t.id DESC
+       LIMIT 3`,
+      [buyerId]
+    );
+    console.log("[getBuyerCancelledEventTickets:sample-owned]", sampleResult.rows);
+
+    const result = await pool.query(
+      `SELECT
+         e.id AS event_id,
+         e.title AS event_title,
+         e.start_at AS event_date,
+         e.venue_name,
+         e.city_display,
+         e.cancelled_at,
+         e.cancel_reason,
+         t.id AS ticket_id,
+         t.status AS ticket_status,
+         t.buyer_name AS attendee_name,
+         oi.id AS order_item_id,
+         oi.ticket_name AS tier_name,
+         oi.ticket_price_amount,
+         oi.ticket_booking_fee_amount,
+         o.id AS order_id,
+         o.order_number,
+         o.created_at AS purchased_at
+       FROM tickets t
+       JOIN orders o ON o.id = t.order_id
+       JOIN events e ON e.id = o.event_id
+       JOIN order_items oi ON oi.id = t.order_item_id
+       WHERE (o.buyer_user_id = $1 OR t.user_id = $1)
+         AND o.payment_status IN ('paid', 'completed', 'succeeded')
+         AND e.status = 'cancelled'
+       ORDER BY e.cancelled_at DESC NULLS LAST, e.id DESC, t.id DESC
+       LIMIT $2 OFFSET $3`,
+      [buyerId, limitNum, offset]
+    );
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM tickets t
+       JOIN orders o ON o.id = t.order_id
+       JOIN events e ON e.id = o.event_id
+       JOIN order_items oi ON oi.id = t.order_item_id
+       WHERE (o.buyer_user_id = $1 OR t.user_id = $1)
+         AND o.payment_status IN ('paid', 'completed', 'succeeded')
+         AND e.status = 'cancelled'`,
+      [buyerId]
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+    console.log("[getBuyerCancelledEventTickets:final-count]", { buyerId, total });
+
+    const nowMs = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    const items = result.rows.map((row) => {
+      const cancelledAt = row.cancelled_at ? new Date(row.cancelled_at) : null;
+      const cancelledAtMs = cancelledAt ? cancelledAt.getTime() : null;
+      const primaryWindowEndsAt = cancelledAtMs ? new Date(cancelledAtMs + 30 * DAY_MS) : null;
+
+      let refundWindowStage = "unknown";
+      let daysLeftInCurrentWindow = null;
+      if (primaryWindowEndsAt && nowMs <= primaryWindowEndsAt.getTime()) {
+        refundWindowStage = "primary";
+        daysLeftInCurrentWindow = Math.ceil((primaryWindowEndsAt.getTime() - nowMs) / DAY_MS);
+      } else if (primaryWindowEndsAt) {
+        refundWindowStage = "closed";
+        daysLeftInCurrentWindow = 0;
+      }
+
+      const ticketStatus = String(row.ticket_status || "").toUpperCase();
+      const alreadyRefunded = ticketStatus === "REFUNDED";
+      const eligibleWindowOpen = refundWindowStage === "primary";
+      const canRequestRefund = eligibleWindowOpen && !alreadyRefunded;
+
+      return {
+        event: {
+          id: row.event_id,
+          title: row.event_title,
+          date: row.event_date,
+          venue_name: row.venue_name,
+          city: row.city_display,
+          status: "cancelled",
+          cancelled_at: row.cancelled_at,
+          cancel_reason: row.cancel_reason || null,
+        },
+        ticket: {
+          id: row.ticket_id,
+          order_item_id: row.order_item_id,
+          order_id: row.order_id,
+          order_number: row.order_number,
+          attendee_name: row.attendee_name,
+          tier_name: row.tier_name,
+          ticket_price: Number(row.ticket_price_amount || 0) / 100,
+          booking_fee: Number(row.ticket_booking_fee_amount || 0) / 100,
+          status: ticketStatus.toLowerCase(),
+          purchased_at: row.purchased_at,
+        },
+        refund_window: {
+          stage: refundWindowStage,
+          primary_window_days: 30,
+          primary_window_ends_at: primaryWindowEndsAt ? primaryWindowEndsAt.toISOString() : null,
+          days_left_in_current_window: daysLeftInCurrentWindow,
+          can_request_refund: canRequestRefund,
+        },
+      };
+    });
+
+    return ok(res, req, {
+      items,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        total_pages: Math.ceil(total / limitNum),
+      },
+    });
+  } catch (err) {
+    console.error("getBuyerCancelledEventTickets error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message || "Failed to fetch cancelled events");
+  }
+};
+
+/**
+ * Refund Centre Step 2 (Phase 1) — submit buyer refund request.
+ * POST /api/orders/buyer/refunds
+ */
+const submitBuyerRefund = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const buyerId = req.user.id;
+    const { order_item_id, reason_code } = req.body || {};
+    const orderItemId = parseInt(order_item_id, 10);
+
+    if (Number.isNaN(orderItemId) || orderItemId <= 0) {
+      return fail(res, req, 400, "VALIDATION_ERROR", "Valid order_item_id is required");
+    }
+    if (!reason_code) {
+      return fail(res, req, 400, "VALIDATION_ERROR", "reason_code is required");
+    }
+
+    await client.query("BEGIN");
+
+    const itemResult = await client.query(
+      `SELECT
+         oi.id AS order_item_id,
+         oi.ticket_price_amount,
+         oi.ticket_booking_fee_amount,
+         oi.quantity,
+         o.id AS order_id,
+         o.buyer_user_id,
+         o.payment_status,
+         e.id AS event_id,
+         e.status AS event_status,
+         e.cancelled_at,
+         e.promoter_id,
+         e.territory_id
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       JOIN ticket_types tt ON tt.id = oi.ticket_type_id
+       JOIN events e ON e.id = tt.event_id
+       WHERE oi.id = $1
+       LIMIT 1`,
+      [orderItemId]
+    );
+
+    if (itemResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 404, "NOT_FOUND", "Order item not found");
+    }
+
+    const item = itemResult.rows[0];
+    if (String(item.buyer_user_id) !== String(buyerId)) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 403, "FORBIDDEN", "Order item does not belong to buyer");
+    }
+    if (!["paid", "completed", "succeeded"].includes(String(item.payment_status || "").toLowerCase())) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Only paid orders can be refunded");
+    }
+    if (item.event_status !== "cancelled") {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Refund request allowed only for cancelled events");
+    }
+    if (!item.cancelled_at) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Refund window unavailable for this event");
+    }
+
+    const cancelledAtMs = new Date(item.cancelled_at).getTime();
+    const primaryWindowEndMs = cancelledAtMs + (30 * 24 * 60 * 60 * 1000);
+    if (Date.now() > primaryWindowEndMs) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "REFUND_WINDOW_CLOSED", "Primary refund window has closed");
+    }
+
+    const duplicateResult = await client.query(
+      `SELECT id
+       FROM refund_cases
+       WHERE order_item_id = $1
+         AND status IN ('submitted', 'under_review', 'approved', 'processing')
+       LIMIT 1`,
+      [orderItemId]
+    );
+    if (duplicateResult.rowCount > 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 409, "DUPLICATE_REFUND_CASE", "An open refund case already exists for this order item");
+    }
+
+    const refundableAmount = Number(item.ticket_price_amount || 0) * Number(item.quantity || 1);
+
+    // Escrow ring-fence: reserve amount in escrow pending liabilities.
+    const territoryId = item.territory_id || 1;
+    const escrowColumnsResult = await client.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'escrow_accounts'`
+    );
+    const escrowColumns = new Set(escrowColumnsResult.rows.map((r) => r.column_name));
+    const hasAccountType = escrowColumns.has("account_type");
+    const hasBalance = escrowColumns.has("balance");
+    const hasCurrentBalance = escrowColumns.has("current_balance");
+    const hasPendingLiabilities = escrowColumns.has("pending_liabilities");
+
+    if (hasAccountType) {
+      await client.query(
+        `INSERT INTO escrow_accounts (territory_id, account_type, current_balance, pending_liabilities, updated_at)
+         VALUES ($1, 'escrow', 0, 0, NOW())
+         ON CONFLICT (territory_id, account_type) DO NOTHING`,
+        [territoryId]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO escrow_accounts (territory_id, balance, pending_liabilities, updated_at)
+         VALUES ($1, 0, 0, NOW())
+         ON CONFLICT (territory_id) DO NOTHING`,
+        [territoryId]
+      );
+    }
+
+    const escrowResult = await client.query(
+      hasAccountType
+        ? `SELECT
+             COALESCE(current_balance, 0) AS current_balance,
+             COALESCE(pending_liabilities, 0) AS pending_liabilities
+           FROM escrow_accounts
+           WHERE territory_id = $1 AND account_type = 'escrow'
+           LIMIT 1`
+        : `SELECT
+             COALESCE(balance, 0) AS balance,
+             COALESCE(pending_liabilities, 0) AS pending_liabilities
+           FROM escrow_accounts
+           WHERE territory_id = $1
+           LIMIT 1`,
+      [territoryId]
+    );
+
+    const escrowRow = escrowResult.rows[0] || {};
+    const currentBalancePence = hasBalance
+      ? Number(escrowRow.balance || 0)
+      : Number(escrowRow.current_balance || 0) * 100;
+    const pendingLiabilitiesPence = Number(escrowRow.pending_liabilities || 0) * (hasBalance ? 1 : 100);
+    if ((currentBalancePence - pendingLiabilitiesPence) < refundableAmount) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 409, "INSUFFICIENT_ESCROW", "Insufficient escrow balance to ring-fence refund amount");
+    }
+
+    if (hasPendingLiabilities) {
+      if (hasBalance) {
+        await client.query(
+          `UPDATE escrow_accounts
+           SET pending_liabilities = COALESCE(pending_liabilities, 0) + $1,
+               updated_at = NOW()
+           WHERE territory_id = $2`,
+          [refundableAmount, territoryId]
+        );
+      } else if (hasCurrentBalance) {
+        const amountInCurrency = refundableAmount / 100;
+        await client.query(
+          `UPDATE escrow_accounts
+           SET pending_liabilities = COALESCE(pending_liabilities, 0) + $1,
+               updated_at = NOW()
+           WHERE territory_id = $2
+             AND account_type = 'escrow'`,
+          [amountInCurrency, territoryId]
+        );
+      }
+    }
+
+    await client.query(
+      `INSERT INTO ledger_entries (
+         entry_type, user_id, role, territory_id, amount, reference_id, reference_type, status
+       )
+       VALUES ('RING_FENCED', $1, 'buyer', $2, $3, $4, 'REFUND_CASE', 'POSTED')`,
+      [buyerId, territoryId, -Math.abs(refundableAmount), orderItemId]
+    );
+
+    const refundCaseResult = await client.query(
+      `INSERT INTO refund_cases (
+         order_item_id, buyer_id, event_id, promoter_id, reason_code, status, amount, escrow_ring_fenced, submitted_at, created_at
+       )
+       VALUES ($1, $2, $3, $4, $5, 'submitted', $6, TRUE, NOW(), NOW())
+       RETURNING id, order_item_id, reason_code, status, amount, escrow_ring_fenced, submitted_at`,
+      [orderItemId, buyerId, item.event_id, item.promoter_id, reason_code, refundableAmount]
+    );
+
+    await client.query("COMMIT");
+
+    const refundCase = refundCaseResult.rows[0];
+    return ok(res, req, {
+      refund_case: {
+        id: refundCase.id,
+        order_item_id: refundCase.order_item_id,
+        reason_code: refundCase.reason_code,
+        status: refundCase.status,
+        amount: Number(refundCase.amount) / 100,
+        escrow_ring_fenced: refundCase.escrow_ring_fenced,
+        submitted_at: refundCase.submitted_at,
+      },
+      message: "Refund request submitted successfully",
+    }, 201);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    if (String(err.message || "").includes("uq_refund_cases_open_order_item")) {
+      return fail(res, req, 409, "DUPLICATE_REFUND_CASE", "An open refund case already exists for this order item");
+    }
+    console.error("submitBuyerRefund error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message);
+  } finally {
+    client.release();
+  }
+};
+
 // ─────────────────────────────────────────────
 // SERVICE 4 — GET /buyer/tickets/:itemId/qr
 // ─────────────────────────────────────────────
@@ -1230,6 +1631,8 @@ module.exports = {
   createOrder,   // POST /orders
   confirmOrder,  // POST /orders/:id/confirm
   getBuyerTickets, // GET /buyer/tickets
+  getBuyerCancelledEventTickets, // GET /buyer/tickets/cancelled-events
+  submitBuyerRefund, // POST /buyer/refunds
   getTicketQR,   // GET /buyer/tickets/:itemId/qr
   scanTicket     // POST /events/:id/scan
 };

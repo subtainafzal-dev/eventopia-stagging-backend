@@ -35,6 +35,13 @@ async function insertPromoterCreditWallet(client, promoterUserId) {
  * @param {import("pg").PoolClient} client
  */
 async function ensurePromoterCreditWallet(client, promoterUserId) {
+  await client.query(
+    `INSERT INTO credit_wallets (user_id, role, projected_balance, available_balance, held_balance, currency)
+     VALUES ($1, 'promoter', 0, 0, 0, 'GBP')
+     ON CONFLICT (user_id, role) DO NOTHING`,
+    [promoterUserId]
+  );
+
   const existing = await client.query(
     `SELECT * FROM promoter_credit_wallets WHERE promoter_id = $1`,
     [promoterUserId]

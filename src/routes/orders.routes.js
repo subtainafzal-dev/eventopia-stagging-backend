@@ -11,6 +11,8 @@ const {
   createOrder,
   confirmOrder,
   getBuyerTickets,
+  getBuyerCancelledEventTickets,
+  submitBuyerRefund,
   getTicketQR,
   scanTicket
 } = require("../controllers/orders.controller");
@@ -55,6 +57,21 @@ router.get(
   requireAuth,
   requireRole("buyer"),
   getBuyerTickets
+);
+
+// Refund Centre: buyer cancelled-event tickets with refund windows
+router.get(
+  "/buyer/tickets/cancelled-events",
+  requireAuth,
+  requireRole("buyer"),
+  getBuyerCancelledEventTickets
+);
+
+router.post(
+  "/buyer/refunds",
+  requireAuth,
+  requireRole("buyer"),
+  submitBuyerRefund
 );
 
 // ─────────────────────────────────────────────────────────────────────────────

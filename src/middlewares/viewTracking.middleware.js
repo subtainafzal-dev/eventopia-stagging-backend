@@ -10,12 +10,7 @@ async function trackEventView(req, res, next) {
       const eventId = match ? match[1] : null;
 
       if (eventId) {
-        // Increment view count
-        await pool.query(
-          `UPDATE events SET views_count = views_count + 1 WHERE id = $1`,
-          [eventId]
-        );
-        // Log the view for analytics
+        // Log the view for analytics. The canonical source of truth is event_views.
         await pool.query(
           `INSERT INTO event_views (event_id, viewer_user_id, ip_address, user_agent)
            VALUES ($1, $2, $3, $4)`,
