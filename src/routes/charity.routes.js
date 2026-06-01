@@ -1,3 +1,8 @@
+/**
+ * Charity route definitions.
+ * Applies authentication and promoter role checks before charity endpoints.
+ */
+
 const express = require("express");
 const router = express.Router();
 
@@ -15,18 +20,8 @@ const {
   getExecutions
 } = require("../controllers/charity.controller");
 
-// All charity routes require authentication and promoter role
+// Charity routes require an authenticated promoter.
 router.use(requireAuth);
 router.use(requirePromoter);
-
-// Charity application routes
-// router.post("/applications", createApplication);
-// router.get("/applications", listMyApplications);
-// router.get("/applications/:id", getApplication);
-// router.put("/applications/:id", updateApplication);
-// router.post("/applications/:id/submit", submitApplication);
-// router.post("/applications/:id/pay-fee", payApplicationFee);
-// router.get("/applications/:id/status", getApplicationStatus);
-// router.get("/applications/:id/executions", getExecutions);
 
 module.exports = router;
